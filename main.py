@@ -24,6 +24,7 @@ import evaluate
 import warnings
 import time
 import pickle
+import random
 warnings.filterwarnings('ignore')
 device_gpu = t.device("cuda")
 
@@ -98,34 +99,40 @@ def sparseTestModel(model, sparse_norm_adj, testMat, uid):
 
 def test(model, sparse_norm_adj, data_loader, top_k, drop_flag=False, save=False):
     HR, NDCG = [], []
+    user_embed, item_embed = model(sparse_norm_adj, drop_flag=False)
     for user, item_i in data_loader:
-        with t.no_grad():
-            batch = int(user.size()[0]/101)
-            userEmbed, posEmbed, _ = model(sparse_norm_adj, user.long(), item_i.long(), [], drop_flag=False)
-            score_pos, _ = model.getScores(userEmbed, posEmbed, posEmbed)
-        for i in range(batch):
-            batch_scores = score_pos[i*101: (i+1)*101]
-            _, indices = t.topk(batch_scores, top_k)
-            tmp_item_i = item_i[i*101: (i+1)*101].cuda()
+        user = user.long().cuda()
+        item_i = item_i.long().cuda()
+        userEmbed = user_embed[user]
+        testItemEmbed = item_embed[item_i]
+        pred_i = t.sum(t.mul(userEmbed, testItemEmbed), dim=1)
+        batch = int(user.cpu().numpy().size/101)
 
+        assert user.cpu().numpy().size % 101 ==0
+        for i in range(batch):
+            batch_scores = pred_i[i*101: (i+1)*101].view(-1)
+            _, indices = t.topk(batch_scores, top_k)
+            tmp_item_i = item_i[i*101: (i+1)*101]
             recommends = t.take(tmp_item_i, indices).cpu().numpy().tolist()
             gt_item = tmp_item_i[0].item()
             HR.append(evaluate.hit(gt_item, recommends))
             NDCG.append(evaluate.ndcg(gt_item, recommends))
-    if save:
-        return HR, NDCG
-    else:
-        return np.mean(HR), np.mean(NDCG)
+        if save:
+            return HR, NDCG
+        else:
+            return np.mean(HR), np.mean(NDCG)
 
 
 if __name__ == '__main__':
     np.random.seed(29)
     t.manual_seed(29)
     t.cuda.manual_seed(29)
+    random.seed(29)
+
     args = parse_args()
     print(args)
     
-    trainMat, testData, validData, trustMat = loadData(args.dataset, args.cv)
+    trainMat, testData, _, trustMat = loadData(args.dataset, args.cv)
     # trainMat, testMat, validMat, testData, validData = loadData(args.dataset, args.cv)
     userNum, itemNum = trainMat.shape
     train_coo = trainMat.tocoo()
@@ -134,19 +141,19 @@ if __name__ == '__main__':
     train_data = np.hstack((train_u.reshape(-1,1), train_v.reshape(-1,1))).tolist()
 
     test_data = testData
-    valid_data = validData
+    # valid_data = validData
 
     train_dataset = BPRData(train_data, itemNum, trainMat, 1, True)
     test_dataset = BPRData(test_data, itemNum, trainMat, 0, False)
-    valid_dataset = BPRData(valid_data, itemNum, trainMat, 0, False)
+    # valid_dataset = BPRData(valid_data, itemNum, trainMat, 0, False)
     train_loader = dataloader.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     test_loader  = dataloader.DataLoader(test_dataset, batch_size=101*args.test_size, shuffle=False, num_workers=0)
-    valid_loader  = dataloader.DataLoader(valid_dataset, batch_size=101*args.test_size, shuffle=False, num_workers=0)
+    # valid_loader  = dataloader.DataLoader(valid_dataset, batch_size=101*args.test_size, shuffle=False, num_workers=0)
 
     userNum, itemNum = trainMat.shape
 
     u_i_adj = (trainMat != 0) * 1 
-    i_u_adj = u_i_adj.T
+    i_u_adj = u_i_adj.T#.tocoo().tocsr()
 
     a = csr_matrix((userNum, userNum))
     b = csr_matrix((itemNum, itemNum))
@@ -184,44 +191,36 @@ if __name__ == '__main__':
         log("start train")
         epoch_loss = 0
         for user, item_i, item_j in train_loader:
-            userEmbed, posEmbed, negEmbed = model(sparse_norm_adj,
-                                                    user,
-                                                    item_i,
-                                                    item_j,
-                                                    drop_flag=True)
+
+            user_idx = user.long().cuda()
+            item_i_idx = item_i.long().cuda()
+            item_j_idx = item_j.long().cuda()
+
+            user_embed, item_embed = model(sparse_norm_adj, drop_flag=True)
+            userEmbed = user_embed[user_idx]
+            posEmbed = item_embed[item_i_idx]
+            negEmbed = item_embed[item_j_idx]
+
+            pred_i = t.sum(t.mul(userEmbed, posEmbed), dim=1)
+            pred_j = t.sum(t.mul(userEmbed, negEmbed), dim=1)
 
 
-            loss, mf_loss = model.create_bpr_loss(userEmbed, posEmbed, negEmbed)
+            bprloss = - (pred_i.view(-1) - pred_j.view(-1)).sigmoid().log().sum()
+            regLoss = (t.norm(userEmbed) ** 2 + t.norm(posEmbed) ** 2 + t.norm(negEmbed) ** 2)
+
+            loss = (bprloss + args.reg * regLoss)/args.batch_size
+
+            # loss, mf_loss = model.create_bpr_loss(userEmbed, posEmbed, negEmbed)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            epoch_loss += mf_loss.item()
+
+            epoch_loss += bprloss.item()
         log("train epoch %d, loss = %.2f"%(epoch, epoch_loss))
         
-        # if epoch > 30:
-        #     valid_hr, valid_ndcg = test(model, sparse_norm_adj, valid_loader, args.top_k)
-        #     log("valid epoch %d, valid_hr=%.4f, valid_ndcg=%.4f\n"%(epoch, valid_hr, valid_ndcg))
-        # else:
-        #     valid_hr, valid_ndcg = 0,0
-        #     cvWait = 0
-        
-        # if epoch > 10:
-        #     valid_hr, valid_ndcg = test(model, sparse_norm_adj, valid_loader, args.top_k)
-        #     # test_hr, test_ndcg = test(model, sparse_norm_adj, test_loader, args.top_k)
-        #     log("valid epoch %d, valid_hr=%.4f, valid_ndcg=%.4f\n"%(epoch, valid_hr, valid_ndcg))
-        # else:
-        #     valid_hr = 0
-        #     cvWait = 0
-        
-        # if epoch != 0 and epoch % 10 == 0:
-        log("start train")
-        if epoch > 40:
-            test_hr, test_ndcg = test(model, sparse_norm_adj, test_loader, args.top_k, drop_flag=False, save=False)
-            log("test epoch %d, test_hr=%.4f, test_ndcg=%.4f\n"%(epoch, test_hr, test_ndcg))
-        else:
-            test_hr, test_ndcg = 0,0
-            cvWait = 0
-
+        test_hr, test_ndcg = test(model, sparse_norm_adj, test_loader, args.top_k, drop_flag=False, save=False)
+        log("test epoch %d, test_hr=%.4f, test_ndcg=%.4f\n"%(epoch, test_hr, test_ndcg))
 
         if test_hr > bestHR:
             bestHR = test_hr
@@ -232,28 +231,6 @@ if __name__ == '__main__':
             cvWait += 1
             log("cvWait = %d"%(cvWait))
         if cvWait == 5:
-            HR, NDCG = test(model, sparse_norm_adj, test_loader, args.top_k, drop_flag=False, save=True)
-            uids = np.array(test_data[::101])[:,0]
-            data = {}
-            assert len(uids) == len(HR)
-            assert len(uids) == len(np.unique(uids))
-            for i in range(len(uids)):
-                uid = uids[i]
-                data[uid] = [HR[i], NDCG[i]]
-
-            with open("NGCF-{0}-cv{1}-test.pkl".format(args.dataset, args.cv), 'wb') as fs:
-                pickle.dump(data, fs)
             break
-        # if epoch == 40:
-        #     print("get embeds")
-        #     user_embed, item_embed = model.getEmbeds(sparse_norm_adj, False)
-        #     embeds = {
-        #         "user_embed": user_embed.detach().cpu().numpy(),
-        #         "item_embed": item_embed.detach().cpu().numpy(),
-        #     }
-        #     with open("Yelp_cv2-embeds.pkl", 'wb') as fs:
-        #         pickle.dump(embeds, fs)
 
-    # test_hr, test_ndcg = test(model, sparse_norm_adj, test_loader, args.top_k)
-    # log("test epoch %d, test_hr=%.4f, test_ndcg=%.4f\n"%(epoch, test_hr, test_ndcg))
     

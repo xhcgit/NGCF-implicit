@@ -111,7 +111,8 @@ class NGCF(nn.Module):
         neg_scores = torch.sum(torch.mul(users, neg_items), axis=1)
         return pos_scores, neg_scores
     
-    def forward(self, sparse_norm_adj, users, pos_items, neg_items, drop_flag=True):
+    # def forward(self, sparse_norm_adj, users, pos_items, neg_items, drop_flag=True):
+    def forward(self, sparse_norm_adj, drop_flag=True):
 
         A_hat = self.sparse_dropout(sparse_norm_adj,
                                     self.node_dropout,
@@ -151,8 +152,10 @@ class NGCF(nn.Module):
             all_embeddings += [norm_embeddings]
 
         all_embeddings = torch.cat(all_embeddings, 1)
-        u_g_embeddings = all_embeddings[:self.n_user, :]
-        i_g_embeddings = all_embeddings[self.n_user:, :]
+        user_embeddings = all_embeddings[:self.n_user, :]
+        item_embeddings = all_embeddings[self.n_user:, :]
+        return user_embeddings, item_embeddings
+
 
         """
         *********************************************************
